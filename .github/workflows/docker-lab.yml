@@ -1,0 +1,198 @@
+name: Docker Lab 8
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+  packages: write
+jobs:
+  practice:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: AleksandrPleskachev/devops_lab7
+          ref: 65a3453
+          persist-credentials: false
+          path: course-source
+      - name: Run Docker exercises
+        shell: bash
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          export LC_ALL=C
+          e="$GITHUB_WORKSPACE/evidence"
+          mkdir -p "$e"
+          cd course-source
+
+          section() { local key=$1; shift; echo "::group::$key"; (set -x; "$@") 2>&1 | tee "$e/$key.txt"; echo '::endgroup::'; }
+          wait_http() {
+            local url=$1
+            for i in {1..40}; do
+              if curl -fsS "$url" >/dev/null 2>&1; then return 0; fi
+              sleep 1
+            done
+            return 1
+          }
+          wait_pg() {
+            local container=$1
+            for i in {1..50}; do
+              if docker exec "$container" pg_isready -h 127.0.0.1 -U postgres -d mydb >/dev/null 2>&1; then return 0; fi
+              sleep 1
+            done
+            return 1
+          }
+          smoke() {
+            local base=$1 id
+            for i in {1..30}; do
+              if curl -sS "$base/courses/missing" >/dev/null 2>&1; then break; fi
+              sleep 1
+            done
+            id=$(curl -fsS -H 'Content-Type: application/json' -d '{"title":"Docker Lab 8","instructor":"Runner","duration":8}' "$base/courses" | jq -er '.id')
+            echo "Course ID: $id"
+            curl -fsS "$base/courses/$id" | jq -ec 'select(.published == false)'
+            curl -fsS -X POST "$base/courses/$id/publish" | jq -ec 'select(.message == "course published")'
+            curl -fsS "$base/courses/$id" | jq -ec 'select(.published == true)'
+          }
+          engine() { docker version; docker info --format 'Driver={{.Driver}} OS={{.OperatingSystem}} Containers={{.Containers}}'; }
+          hello() { docker run --name lab8-hello hello-world; }
+          images() {
+            docker pull nginx:latest
+            docker pull nginx:alpine
+            docker images nginx
+            docker image inspect nginx:latest --format 'ID={{.Id}} Size={{.Size}} bytes'
+            docker rmi nginx:alpine
+          }
+          lifecycle() {
+            docker run -d --name my-nginx nginx:latest
+            docker ps --filter name=my-nginx
+            docker logs my-nginx
+            if docker rmi nginx:latest; then echo 'Unexpectedly removed image in use'; return 1; fi
+            docker stop my-nginx
+            docker ps -a --filter name=my-nginx
+            docker start my-nginx
+            docker restart my-nginx
+            docker stop my-nginx
+            docker rm my-nginx
+          }
+          ports() {
+            docker run -d --name web -p 127.0.0.1:8080:80 nginx:latest
+            wait_http http://127.0.0.1:8080/
+            docker port web
+            curl -fsS http://127.0.0.1:8080/ | grep -F 'Welcome to nginx!'
+          }
+          inside() {
+            docker exec web hostname
+            docker exec web ls /etc/nginx
+            docker exec web sh -c 'printf test > /tmp/lab8-check.txt'
+            docker exec web cat /tmp/lab8-check.txt
+            echo
+          }
+          bind_mount() {
+            local html="$RUNNER_TEMP/lab8-html"
+            mkdir -p "$html"
+            echo '<h1>Hello from host</h1>' > "$html/index.html"
+            docker run -d --name web-bind -p 127.0.0.1:8081:80 -v "$html:/usr/share/nginx/html:ro" nginx:latest
+            wait_http http://127.0.0.1:8081/
+            curl -fsS http://127.0.0.1:8081/ | grep -F 'Hello from host'
+            echo '<h1>Updated on host</h1>' > "$html/index.html"
+            curl -fsS http://127.0.0.1:8081/ | grep -F 'Updated on host'
+          }
+          volume() {
+            docker volume create pgdata
+            docker run -d --name pg -e POSTGRES_PASSWORD=lab8-demo -e POSTGRES_DB=mydb -v pgdata:/var/lib/postgresql/data postgres:16
+            wait_pg pg
+            docker exec pg psql -v ON_ERROR_STOP=1 -U postgres -d mydb -c "CREATE TABLE test (id int PRIMARY KEY, note text); INSERT INTO test VALUES (1, 'persisted');"
+            docker rm -f pg
+            docker run -d --name pg2 -e POSTGRES_PASSWORD=lab8-demo -e POSTGRES_DB=mydb -v pgdata:/var/lib/postgresql/data postgres:16
+            wait_pg pg2
+            docker exec pg2 psql -v ON_ERROR_STOP=1 -U postgres -d mydb -c '\dt'
+            docker exec pg2 psql -U postgres -d mydb -Atc 'SELECT id, note FROM test' | grep -Fx '1|persisted'
+            docker volume inspect pgdata
+          }
+          network() {
+            docker network create mynet
+            docker run -d --name nginx1 --network mynet nginx:latest
+            docker run -d --name net-client --network mynet alpine:3.22 sleep 300
+            docker exec net-client nslookup nginx1
+            docker exec net-client wget -qO- http://nginx1 | grep -F 'Welcome to nginx!'
+            docker network inspect mynet --format 'driver={{.Driver}} containers={{json .Containers}}'
+          }
+          build_images() {
+            mkdir lab8-fixtures
+            dd if=/dev/urandom of=lab8-fixtures/context.bin bs=1M count=4 status=none
+            cp .dockerignore "$RUNNER_TEMP/lab8-dockerignore"
+            rm .dockerignore
+            docker build --progress=plain -t lab8-courses:no-ignore . > "$e/build-no-ignore.txt" 2>&1
+            cp "$RUNNER_TEMP/lab8-dockerignore" .dockerignore
+            printf '\nlab8-fixtures/\n' >> .dockerignore
+            docker build --progress=plain -t lab8-courses:multi . > "$e/build-multi.txt" 2>&1
+            cat > Dockerfile.single <<'EOF'
+          FROM golang:1.22.12-alpine
+          WORKDIR /src
+          COPY go.mod go.sum ./
+          RUN go mod download
+          COPY . .
+          RUN CGO_ENABLED=0 go build -trimpath -o /usr/local/bin/courses ./cmd/server
+          ENV HTTP_ADDR=:8080 GRPC_ADDR=:9090
+          EXPOSE 8080 9090
+          ENTRYPOINT ["/usr/local/bin/courses"]
+          EOF
+            docker build --progress=plain -f Dockerfile.single -t lab8-courses:single . > "$e/build-single.txt" 2>&1
+            for name in build-no-ignore build-multi; do
+              echo "$name context:"
+              grep -A 2 'load build context' "$e/$name.txt"
+            done
+            docker image inspect lab8-courses:no-ignore lab8-courses:multi lab8-courses:single --format '{{index .RepoTags 0}} {{.Size}} bytes' | tee "$e/image-sizes.txt"
+          }
+          app_network() {
+            docker network create appnet
+            docker run -d --name db --network appnet -e POSTGRES_PASSWORD=lab8-demo postgres:16
+            wait_pg db
+            docker run -d --name api --network appnet -p 127.0.0.1:8082:8080 lab8-courses:multi
+            docker exec api nslookup db
+            docker network inspect appnet --format 'driver={{.Driver}} containers={{json .Containers}}'
+            smoke http://127.0.0.1:8082
+          }
+          registry() {
+            local ref="ghcr.io/${GITHUB_REPOSITORY,,}/courses:v1"
+            docker tag lab8-courses:multi "$ref"
+            docker push "$ref"
+            docker rm -f api
+            docker rmi "$ref" lab8-courses:multi
+            docker pull "$ref"
+            docker run -d --name registry-api -p 127.0.0.1:8082:8080 "$ref"
+            smoke http://127.0.0.1:8082
+          }
+          cleanup() {
+            docker system df
+            docker rm -f lab8-hello web web-bind pg2 nginx1 net-client db registry-api
+            docker network rm mynet appnet
+            docker volume rm pgdata
+            docker system prune -af --volumes
+            docker system df
+          }
+          section 01-engine engine
+          section 02-hello hello
+          section 03-images images
+          section 04-lifecycle lifecycle
+          section 05-ports ports
+          section 06-exec inside
+          section 07-bind bind_mount
+          section 08-volume volume
+          section 09-network network
+          section 10-build build_images
+          section 11-appnet app_network
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          section 12-registry registry
+          section 13-cleanup cleanup
+          cp Dockerfile Dockerfile.single .dockerignore "$e/"
+      - name: Save Docker evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-lab8-evidence
+          path: evidence/
+          if-no-files-found: error
